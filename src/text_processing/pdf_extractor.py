@@ -4,8 +4,9 @@ from enum import auto, Enum
 import fitz
 import re
 from dataclasses import dataclass
-from text_processing.mineru import run_mineru
+from src.text_processing.mineru import run_mineru
 import json
+from src.paths import MINERU_OUTPUT_DIR
 
 
 class DocumentType(Enum):
@@ -86,44 +87,53 @@ class PDFExtractor:
     - добавление контекста разделов к документам.
     """
 
-    def get_documents_from_text(
-            self,
-            pdf_path: str,
-            output_mineru_dir_path: str = None,
-            use_context: bool = True,
-    ) -> list[Metadata]:
+    @staticmethod
+    def _remove_references_section(documents: list[Metadata]) -> list[Metadata]:
         """
-        Извлекает структурированные документы из PDF-файла.
+        Удаляет список литературы, список источников и references из документов.
 
-        Метод выполняет полный базовый пайплайн обработки PDF:
-        1. Получает результат обработки PDF через MinerU.
-           Если результат уже существует, он просто читается из JSON.
-           Если результата нет, запускается MinerU.
-        2. Преобразует блоки типа "list" в обычные paragraph-блоки,
-           чтобы списки также попадали в текстовые документы.
-        3. Преобразует MinerU JSON в список объектов Metadata:
-           абзацы, формулы, изображения, графики и title-блоки.
-        4. При необходимости добавляет контекст секций к каждому документу
-           на основе найденных заголовков.
+        Удаление начинается с документа, который похож на заголовок библиографии,
+        и продолжается до конца списка документов.
 
-        :param pdf_path: путь к исходному PDF-файлу
-        :param output_mineru_dir_path: путь к директории с результатами MinerU.
-            Если None, используется директория по умолчанию "data/mineru_output"
-        :param use_context: если True, к документам добавляется контекст разделов.
-            Если False, документы возвращаются без заполнения поля section
-        :return: список объектов Metadata, извлечённых из PDF
+        :param documents: список Metadata
+        :return: список Metadata без библиографического раздела
         """
+        result = []
 
-        pdf_path = Path(pdf_path)
+        for doc in documents:
+            content = doc.content or ""
+            content_norm = content.strip().lower()
+            content_norm = content_norm.replace("ё", "е")
+            content_norm = re.sub(r"\s+", " ", content_norm)
 
-        json_file = self._get_mineru_doc(str(pdf_path), output_mineru_dir_path)
-        json_file = self._do_lists_to_paragraph(json_file)
+            if PDFExtractor._is_references_heading(content_norm):
+                break
 
-        documents = self._create_documents_from_json(json_file, pdf_path.stem)
-        if use_context:
-            documents = self._get_context(documents, [])
-        return documents
+            result.append(doc)
 
+        return result
+
+    @staticmethod
+    def _is_references_heading(text: str) -> bool:
+        """
+        Проверяет, является ли строка заголовком списка литературы.
+
+        :param text: нормализованный текст
+        :return: True, если это заголовок библиографии
+        """
+        patterns = [
+            r"^литература$",
+            r"^список литературы$",
+            r"^список использованной литературы$",
+            r"^использованная литература$",
+            r"^список источников$",
+            r"^список использованных источников$",
+            r"^источники$",
+            r"^references$",
+            r"^bibliography$",
+        ]
+
+        return any(re.fullmatch(pattern, text, flags=re.I) for pattern in patterns)
 
     def _create_documents_from_json(self, json_file, source: str = "") -> list[Metadata]:
         """
@@ -283,58 +293,723 @@ class PDFExtractor:
                 block_id += 1
         return documents
 
+    def get_documents_from_text(
+            self,
+            pdf_path: str | Path,
+            use_context: bool = False,
+            type_context: str = "gold",
+            keep_abstract_before_first_section: bool = True,
+            remove_after_references: bool = True,
+    ) -> list[Metadata]:
+        """
+        Извлекает структурированные документы из PDF-файла.
+
+        Метод выполняет полный базовый пайплайн обработки PDF:
+        1. Получает результат обработки PDF через MinerU.
+        2. Преобразует блоки типа "list" в paragraph-блоки.
+        3. Преобразует MinerU JSON в список объектов Metadata.
+        4. При необходимости добавляет контекст секций.
+        5. До первого настоящего заголовка оставляет только аннотацию.
+        6. После списка литературы может обрезать документ.
+
+        :param pdf_path: путь к исходному PDF-файлу
+        :param use_context: использовать ли контекст разделов
+        :param type_context: источник заголовков: gold, mineru, mupdf
+        :param keep_abstract_before_first_section: оставить ли аннотацию до первого раздела
+        :param remove_after_references: удалить ли список литературы и всё после него
+        :return: список Metadata
+        """
+        pdf_path = Path(pdf_path)
+
+        json_file = self._get_mineru_doc(str(pdf_path))
+        json_file = self._do_lists_to_paragraph(json_file)
+
+        documents = self._create_documents_from_json(json_file, pdf_path.stem)
+
+        if use_context:
+            documents = self._get_context(
+                documents=documents,
+                file_path=str(pdf_path),
+                type_context=type_context,
+                keep_abstract_before_first_section=keep_abstract_before_first_section,
+                remove_after_references=remove_after_references,
+            )
+
+        return documents
+
     def _get_context(
             self,
             documents: list[Metadata],
-            headers_list: list[str],
+            file_path: str | Path,
+            type_context: str = "gold",
+            keep_abstract_before_first_section: bool = True,
+            remove_after_references: bool = True,
     ) -> list[Metadata]:
         """
-        Добавляет контекст разделов к извлечённым документам.
+        Добавляет каждому Metadata название раздела, в котором находится элемент.
 
-        Метод проходит по списку документов в исходном порядке и отслеживает
-        текущий раздел статьи. Если содержимое документа начинается с одного
-        из заголовков из headers_list, текущий стек секций обновляется.
-        Все последующие документы получают значение section, соответствующее
-        текущему разделу.
+        До первого настоящего заголовка сохраняется только аннотация.
 
-        Если заголовок находится в начале абзаца, он удаляется из content,
-        чтобы в тексте чанка остался только основной текст без дублирования
-        заголовка. Сам заголовок при этом сохраняется в поле section.
+        Если явного блока "Аннотация" нет, но найден блок "Ключевые слова",
+        то в качестве аннотации берётся предыдущий содержательный абзац.
 
-        Документы типа TITLE используются только как служебные маркеры смены
-        раздела. В итоговый список документов они не добавляются, чтобы в RAG
-        не попадали отдельные чанки, состоящие только из заголовков.
-
-        :param documents: список объектов Metadata, полученных из MinerU JSON
-        :param headers_list: список подтверждённых заголовков разделов.
-            Обычно формируется через PyMuPDF/MinerU-кандидаты и LLM
-        :return: список объектов Metadata с заполненным полем section
+        :param documents: список Metadata для обработки
+        :param file_path: путь к PDF-файлу
+        :param type_context: источник заголовков: gold, mineru или mupdf
+        :param keep_abstract_before_first_section: оставить ли аннотацию до первого раздела
+        :param remove_after_references: удалить ли библиографию и всё после неё
+        :return: список Metadata с заполненным section
         """
+        file_path = Path(file_path)
+
+        headers = self._get_headers_for_context(
+            file_path=file_path,
+            type_context=type_context,
+        )
+
+        if not headers:
+            return documents
+
+        start_header = self._choose_start_header(headers)
+
         sections = []
         result = []
 
+        started = False
+
+        pre_section_docs = []
+        abstract_added = False
+
         for doc in documents:
             content = doc.content or ""
+            content = content.strip()
 
-            header = self._find_matching_heading_prefix(content, headers_list)
-
-            if header is not None:
-                sections = self._update_sections(sections, header)
-                content = self._remove_heading_prefix(content, header)
-
-
-            if doc.content_type == DocumentType.TITLE:
+            if not content:
                 continue
 
-            if not content.strip():
+            matched_header = self._find_matching_heading_prefix_robust(
+                text=content,
+                headers_list=headers,
+            )
+
+            title_header = None
+
+            if doc.content_type == DocumentType.TITLE:
+                title_header = self._find_best_header_match(
+                    text=content,
+                    headers_list=headers,
+                )
+
+            header = title_header or matched_header
+
+            if not started:
+                if header and self._headers_are_same(header, start_header):
+                    started = True
+
+                    if (
+                            keep_abstract_before_first_section
+                            and not abstract_added
+                    ):
+                        fallback_abstract_doc = self._extract_abstract_before_keywords(
+                            pre_section_docs
+                        )
+
+                        if fallback_abstract_doc:
+                            result.append(fallback_abstract_doc)
+                            abstract_added = True
+
+                    sections = self._update_sections(
+                        sections=sections,
+                        header=header,
+                    )
+
+                    doc.section = self._current_section(sections)
+
+                    if doc.content_type == DocumentType.PARAGRAPH:
+                        cleaned_content = self._remove_heading_prefix(
+                            text=content,
+                            header=header,
+                        )
+
+                        if cleaned_content:
+                            doc.content = cleaned_content
+
+                    result.append(doc)
+                    continue
+
+                pre_section_docs.append(doc)
+
+                if (
+                        keep_abstract_before_first_section
+                        and not abstract_added
+                        and self._is_russian_abstract_block(content)
+                ):
+                    abstract_doc = deepcopy(doc)
+                    abstract_doc.section = "Аннотация"
+                    abstract_doc.content_type = DocumentType.PARAGRAPH
+                    abstract_doc.content = self._clean_abstract_text(content)
+
+                    if abstract_doc.content:
+                        result.append(abstract_doc)
+                        abstract_added = True
+
+                continue
+
+            if header:
+                if self._is_context_references_header(header):
+                    if remove_after_references:
+                        break
+
+                    sections = self._update_sections(
+                        sections=sections,
+                        header=header,
+                    )
+
+                    doc.section = self._current_section(sections)
+                    result.append(doc)
+                    continue
+
+                if self._is_service_context_header(header):
+                    continue
+
+                sections = self._update_sections(
+                    sections=sections,
+                    header=header,
+                )
+
+                doc.section = self._current_section(sections)
+
+                if doc.content_type == DocumentType.PARAGRAPH:
+                    cleaned_content = self._remove_heading_prefix(
+                        text=content,
+                        header=header,
+                    )
+
+                    if cleaned_content:
+                        doc.content = cleaned_content
+
+                result.append(doc)
                 continue
 
             doc.section = self._current_section(sections)
-            doc.content = content.strip()
-
             result.append(doc)
 
         return result
+
+    @staticmethod
+    def _extract_abstract_before_keywords(
+            pre_section_docs: list[Metadata],
+    ) -> Metadata | None:
+        """
+        Извлекает аннотацию из блоков до первого основного заголовка.
+
+        Если явного блока "Аннотация" нет, но есть блок "Ключевые слова",
+        то аннотацией считается ближайший предыдущий содержательный абзац.
+
+        Пример:
+        [
+            "Название статьи",
+            "Авторы",
+            "В статье рассматривается ...",
+            "Ключевые слова: нейронные сети, классификация"
+        ]
+
+        В этом случае будет взят:
+        "В статье рассматривается ..."
+
+        :param pre_section_docs: документы до первого настоящего раздела
+        :return: Metadata с section="Аннотация" или None
+        """
+        if not pre_section_docs:
+            return None
+
+        for index, doc in enumerate(pre_section_docs):
+            content = doc.content or ""
+
+            if not PDFExtractor._is_keywords_block(content):
+                continue
+
+            for prev_doc in reversed(pre_section_docs[:index]):
+                prev_content = prev_doc.content or ""
+                prev_content = prev_content.strip()
+
+                if PDFExtractor._is_good_fallback_abstract(prev_content):
+                    abstract_doc = deepcopy(prev_doc)
+                    abstract_doc.section = "Аннотация"
+                    abstract_doc.content_type = DocumentType.PARAGRAPH
+                    abstract_doc.content = PDFExtractor._clean_fallback_abstract_text(
+                        prev_content
+                    )
+
+                    return abstract_doc
+
+        return None
+
+    @staticmethod
+    def _is_keywords_block(text: str) -> bool:
+        """
+        Проверяет, является ли блок блоком ключевых слов.
+
+        :param text: текст блока
+        :return: True, если это ключевые слова
+        """
+        text_norm = str(text).strip().lower()
+        text_norm = text_norm.replace("ё", "е")
+        text_norm = re.sub(r"\s+", " ", text_norm)
+
+        patterns = [
+            r"^ключевые слова\s*[:.].+",
+            r"^ключевые слова\s+.+",
+            r"^keywords\s*[:.].+",
+            r"^key words\s*[:.].+",
+        ]
+
+        return any(
+            re.match(pattern, text_norm, flags=re.I)
+            for pattern in patterns
+        )
+
+    @staticmethod
+    def _is_good_fallback_abstract(text: str) -> bool:
+        """
+        Проверяет, похож ли абзац перед ключевыми словами на аннотацию.
+
+        Отсекает:
+        - УДК, DOI;
+        - авторов;
+        - название статьи;
+        - слишком короткие блоки;
+        - английские блоки;
+        - служебные строки.
+
+        :param text: текст-кандидат
+        :return: True, если блок можно считать аннотацией
+        """
+        text = str(text).strip()
+        text_norm = text.lower()
+        text_norm = text_norm.replace("ё", "е")
+        text_norm = re.sub(r"\s+", " ", text_norm)
+
+        if len(text_norm) < 120:
+            return False
+
+        bad_prefixes = [
+            "удк",
+            "doi",
+            "для цитирования",
+            "for citation",
+            "content",
+            "license",
+            "©",
+            "issn",
+            "edn",
+            "грнти",
+        ]
+
+        if any(text_norm.startswith(prefix) for prefix in bad_prefixes):
+            return False
+
+        bad_contains = [
+            "e-mail",
+            "email",
+            "orcid",
+            "университет",
+            "институт",
+            "академия",
+            "кафедра",
+            "россия",
+            "russia",
+            "moscow",
+            "abstract",
+            "keywords",
+            "key words",
+        ]
+
+        if any(item in text_norm for item in bad_contains):
+            return False
+
+        russian_letters = re.findall(r"[а-яё]", text_norm)
+        if len(russian_letters) < 50:
+            return False
+
+        abstract_markers = [
+            "рассмотр",
+            "предлож",
+            "представлен",
+            "исследован",
+            "проведен",
+            "показан",
+            "описан",
+            "разработан",
+            "цель",
+            "задач",
+            "метод",
+            "результат",
+            "анализ",
+        ]
+
+        if not any(marker in text_norm for marker in abstract_markers):
+            return False
+
+        return True
+
+    @staticmethod
+    def _clean_fallback_abstract_text(text: str) -> str:
+        """
+        Очищает fallback-аннотацию.
+
+        :param text: исходный текст
+        :return: очищенный текст
+        """
+        text = str(text).strip()
+
+        text = re.sub(
+            r"\s+",
+            " ",
+            text,
+        )
+
+        return text.strip()
+
+    @staticmethod
+    def _is_russian_abstract_block(text: str) -> bool:
+        """
+        Проверяет, является ли блок русской аннотацией.
+
+        Метод специально не считает английский Abstract аннотацией,
+        чтобы до первого раздела сохранялась только русская аннотация.
+
+        :param text: текст блока
+        :return: True, если блок похож на русскую аннотацию
+        """
+        text = str(text).strip()
+        text_norm = text.lower()
+        text_norm = text_norm.replace("ё", "е")
+        text_norm = re.sub(r"\s+", " ", text_norm)
+
+        if re.match(r"^аннотация\s*[:.]", text_norm):
+            return True
+
+        if re.match(r"^аннотация\s+", text_norm):
+            return True
+
+        return False
+
+    @staticmethod
+    def _clean_abstract_text(text: str) -> str:
+        """
+        Очищает текст аннотации от служебного префикса.
+
+        :param text: исходный текст аннотации
+        :return: очищенный текст аннотации
+        """
+        text = str(text).strip()
+
+        text = re.sub(
+            r"^аннотация\s*[:.]\s*",
+            "",
+            text,
+            flags=re.I,
+        )
+
+        text = re.sub(
+            r"\s+",
+            " ",
+            text,
+        )
+
+        return text.strip()
+
+    @staticmethod
+    def _choose_start_header(headers: list[str]) -> str | None:
+        """
+        Выбирает заголовок, с которого начинается основная часть статьи.
+
+        Если есть "Введение", выбирается оно.
+        Если "Введения" нет, выбирается первый содержательный заголовок.
+
+        :param headers: список заголовков
+        :return: стартовый заголовок или None
+        """
+        if not headers:
+            return None
+
+        for header in headers:
+            if PDFExtractor._is_intro_header(header):
+                return header
+
+        for header in headers:
+            if PDFExtractor._is_service_context_header(header):
+                continue
+
+            if PDFExtractor._is_context_references_header(header):
+                continue
+
+            return header
+
+        return headers[0]
+
+    @staticmethod
+    def _headers_are_same(header_1: str | None, header_2: str | None) -> bool:
+        """
+        Проверяет, совпадают ли два заголовка после нормализации.
+
+        :param header_1: первый заголовок
+        :param header_2: второй заголовок
+        :return: True, если заголовки совпадают
+        """
+        if not header_1 or not header_2:
+            return False
+
+        return (
+                PDFExtractor._normalize_for_context_match(header_1)
+                == PDFExtractor._normalize_for_context_match(header_2)
+        )
+
+    @staticmethod
+    def _is_intro_header(header: str) -> bool:
+        """
+        Проверяет, является ли заголовок введением.
+
+        :param header: заголовок
+        :return: True, если это введение
+        """
+        header_norm = PDFExtractor._normalize_for_context_match(header)
+
+        patterns = [
+            r"^введение$",
+            r"^1 введение$",
+            r"^1\. введение$",
+            r"^1 введение и постановка задачи$",
+            r"^1\. введение и постановка задачи$",
+        ]
+
+        return any(
+            re.fullmatch(pattern, header_norm, flags=re.I)
+            for pattern in patterns
+        )
+
+    @staticmethod
+    def _is_service_context_header(header: str) -> bool:
+        """
+        Проверяет, является ли заголовок служебным блоком.
+
+        :param header: заголовок
+        :return: True, если это служебный заголовок
+        """
+        header_norm = PDFExtractor._normalize_for_context_match(header)
+
+        patterns = [
+            r"^аннотация$",
+            r"^abstract$",
+            r"^ключевые слова$",
+            r"^keywords$",
+            r"^key words$",
+            r"^для цитирования$",
+            r"^for citation$",
+            r"^цель исследования$",
+            r"^материалы и методы исследования$",
+            r"^результаты$",
+        ]
+
+        return any(
+            re.fullmatch(pattern, header_norm, flags=re.I)
+            for pattern in patterns
+        )
+
+    @staticmethod
+    def _is_context_references_header(header: str) -> bool:
+        """
+        Проверяет, является ли заголовок началом библиографического раздела.
+
+        :param header: заголовок
+        :return: True, если это литература / references
+        """
+        header_norm = PDFExtractor._normalize_for_context_match(header)
+
+        patterns = [
+            r"^литература$",
+            r"^список литературы$",
+            r"^список источников$",
+            r"^список использованной литературы$",
+            r"^список использованных источников$",
+            r"^источники$",
+            r"^references$",
+            r"^bibliography$",
+            r"^список литературы references$",
+            r"^список литературы / references$",
+        ]
+
+        return any(
+            re.fullmatch(pattern, header_norm, flags=re.I)
+            for pattern in patterns
+        )
+
+    def _get_headers_for_context(
+            self,
+            file_path: Path,
+            type_context: str = "gold",
+    ) -> list[str]:
+        """
+        Получает список заголовков для построения контекста.
+
+        :param file_path: путь к PDF-файлу
+        :param type_context: источник заголовков: gold, mineru или mupdf
+        :return: список заголовков
+        """
+        type_context = type_context.lower().strip()
+
+        if type_context == "gold":
+            return self._get_gold_headers(file_path)
+
+        if type_context == "mineru":
+            pretends = self.get_headers_by_mineru(str(file_path))
+            return [
+                item.content
+                for item in pretends
+                if item.content
+            ]
+
+        if type_context == "mupdf":
+            pretends = self.get_headers_by_mupdf(str(file_path))
+            return [
+                item.content
+                for item in pretends
+                if item.content
+            ]
+
+        raise ValueError(
+            f"Неизвестный type_context={type_context}. "
+            f"Доступные значения: gold, mineru, mupdf"
+        )
+
+    @staticmethod
+    def _get_gold_headers(file_path: str | Path) -> list[str]:
+        """
+        Загружает ручные заголовки документа из data/gold_headers.json.
+
+        Метод ищет запись по имени PDF-файла.
+
+        :param file_path: путь к PDF-файлу
+        :return: список эталонных заголовков
+        """
+        file_path = Path(file_path)
+        document_name = file_path.name
+
+        gold_path = Path(MINERU_OUTPUT_DIR).parent / "gold_headers.json"
+
+        if not gold_path.exists():
+            raise FileNotFoundError(
+                f"Файл ручной разметки не найден: {gold_path}"
+            )
+
+        with open(gold_path, "r", encoding="utf-8") as file:
+            gold_data = json.load(file)
+
+        for item in gold_data:
+            if item.get("document") == document_name:
+                return item.get("headers", [])
+
+        return []
+
+    @staticmethod
+    def _normalize_for_context_match(text: str) -> str:
+        """
+        Нормализует текст для сравнения заголовков.
+
+        :param text: исходный текст
+        :return: нормализованный текст
+        """
+        text = str(text).lower()
+        text = text.replace("ё", "е")
+        text = text.replace("\u00ad", "")
+        text = text.replace("\ufeff", "")
+
+        text = text.replace("–", "-")
+        text = text.replace("—", "-")
+
+        text = re.sub(r"\s+", " ", text)
+        text = text.strip()
+
+        text = re.sub(r"^(\d+(?:\.\d+)*)\s+", r"\1. ", text)
+        text = re.sub(r"^(\d+(?:\.\d+)*)\.\.\s+", r"\1. ", text)
+
+        text = re.sub(r"[:.;,\s]+$", "", text)
+        text = re.sub(r"[^\w\s.\-]", " ", text)
+        text = re.sub(r"\s+", " ", text)
+
+        return text.strip()
+
+    def _find_best_header_match(
+            self,
+            text: str,
+            headers_list: list[str],
+    ) -> str | None:
+        """
+        Проверяет, совпадает ли текст с одним из заголовков.
+
+        Метод используется в первую очередь для title-блоков MinerU.
+
+        :param text: текст блока
+        :param headers_list: список известных заголовков
+        :return: найденный заголовок или None
+        """
+        text_norm = self._normalize_for_context_match(text)
+
+        for header in headers_list:
+            header_norm = self._normalize_for_context_match(header)
+
+            if text_norm == header_norm:
+                return header
+
+        return None
+
+    def _find_matching_heading_prefix_robust(
+            self,
+            text: str,
+            headers_list: list[str],
+    ) -> str | None:
+        """
+        Ищет заголовок, с которого начинается текст.
+
+        Метод нужен для случаев:
+        - "1. Введение. Далее текст..."
+        - "Введение. Далее текст..."
+        - "2. Метод исследования Далее текст..."
+        - title-блок отдельно совпадает с заголовком.
+
+        :param text: текст текущего Metadata
+        :param headers_list: список известных заголовков
+        :return: найденный заголовок или None
+        """
+        text = str(text).strip()
+        text_norm = self._normalize_for_context_match(text)
+
+        headers_sorted = sorted(
+            headers_list,
+            key=lambda h: len(self._normalize_for_context_match(h)),
+            reverse=True,
+        )
+
+        for header in headers_sorted:
+            header_norm = self._normalize_for_context_match(header)
+
+            if not header_norm:
+                continue
+
+            if text_norm == header_norm:
+                return header
+
+            if text_norm.startswith(header_norm + " "):
+                return header
+
+            if text_norm.startswith(header_norm + ". "):
+                return header
+
+            if text_norm.startswith(header_norm + ": "):
+                return header
+
+        return None
 
     @staticmethod
     def _remove_heading_prefix(text: str, header: str) -> str:
@@ -348,22 +1023,42 @@ class PDFExtractor:
         :param header: заголовок, найденный в начале текста
         :return: текст без заголовка в начале
         """
-        text = text.strip()
-        header = header.strip()
+        text = str(text).strip()
+        header = str(header).strip()
 
-        if text.startswith(header):
-            return text[len(header):].strip()
+        if not text or not header:
+            return text
 
-        if not header.endswith(".") and text.startswith(header + "."):
-            return text[len(header) + 1:].strip()
+        escaped_header = re.escape(header)
 
-        if header.endswith(".") and text.startswith(header[:-1]):
-            return text[len(header[:-1]):].strip()
+        patterns = [
+            rf"^{escaped_header}\s*[\.:]\s*",
+            rf"^{escaped_header}\s+",
+        ]
+
+        if header.endswith("."):
+            header_without_dot = re.escape(header.rstrip("."))
+            patterns.extend([
+                rf"^{header_without_dot}\s*[\.:]\s*",
+                rf"^{header_without_dot}\s+",
+            ])
+
+        for pattern in patterns:
+            new_text = re.sub(
+                pattern,
+                "",
+                text,
+                count=1,
+                flags=re.I,
+            ).strip()
+
+            if new_text != text:
+                return new_text
 
         return text
 
     @staticmethod
-    def _get_mineru_doc(pdf_path: str, output_mineru_dir_path: str | None = None):
+    def _get_mineru_doc(pdf_path: str):
         """
         Загружает результат обработки PDF из MinerU.
         Если результата ещё нет, запускает MinerU и затем читает JSON.
@@ -373,10 +1068,7 @@ class PDFExtractor:
         :return: содержимое content_list JSON в виде Python-объекта
         """
         pdf_path = Path(pdf_path)
-        if output_mineru_dir_path is None:
-            output_mineru_dir_path = Path("data/mineru_output")
-        else:
-            output_mineru_dir_path = Path(output_mineru_dir_path)
+        output_mineru_dir_path = Path(MINERU_OUTPUT_DIR)
         pdf_stem = pdf_path.stem
         content_json_path = (
                 output_mineru_dir_path
@@ -385,7 +1077,7 @@ class PDFExtractor:
                 / f"{pdf_stem}_content_list_v2.json"
         )
         if not content_json_path.exists():
-            run_mineru(str(pdf_path), str(output_mineru_dir_path))
+            run_mineru(str(pdf_path))
         if not content_json_path.exists():
             raise FileNotFoundError(
                 f"MinerU отработал, но файл не найден: {content_json_path}"
@@ -393,7 +1085,7 @@ class PDFExtractor:
         with open(content_json_path, "r", encoding="utf-8") as f:
             return json.load(f)
 
-    def _get_headers_by_mupdf(self, file_path) -> list[HeaderPretend]:
+    def get_headers_by_mupdf(self, file_path) -> list[HeaderPretend]:
         """
         Извлекает список заголовков разделов из PDF-файла.
 
@@ -439,13 +1131,12 @@ class PDFExtractor:
 
                         line_text = self._normalize_text(line_text)
 
-
                         if not line_text:
                             continue
                         all_lines.append(line_text)
                         # Проверяем признаки всей строки
                         is_bold_line = any(
-                            "bold" in span["font"].lower() or span["flags"] & 2 ** 4
+                            "bold" in span["font"].lower() or span["flags"] & 2 ** 4 or span["flags"] & 2
                             for span in spans
                         )
 
@@ -494,7 +1185,7 @@ class PDFExtractor:
             )
         return headers
 
-    def _get_headers_by_mineru(self, json_file) -> list[HeaderPretend]:
+    def get_headers_by_mineru(self, file_path: str) -> list[HeaderPretend]:
         """
         Собирает кандидаты в заголовки из title-блоков MinerU.
 
@@ -503,12 +1194,14 @@ class PDFExtractor:
         Вместе с кандидатом сохраняются соседние текстовые блоки, чтобы LLM
         могла отличать заголовки разделов от названий статей, авторов и служебных строк.
 
-        :param json_file: JSON-документ MinerU в виде списка страниц и блоков
+        :param file_path: путь к пдф документу
         :return: список кандидатов HeaderPretend, найденных по title-блокам MinerU
         """
 
         text_blocks = []
         global_block_id = 0
+
+        json_file = self._get_mineru_doc(file_path)
 
         for page_num, page in enumerate(json_file, start=1):
             for block in page:
@@ -833,10 +1526,6 @@ class PDFExtractor:
         if text_lower.startswith(bad_prefixes):
             return False
 
-        # Нумерованные заголовки:
-        # 1 Введение
-        # 1. Введение
-        # 3.1 Предлагаемый КЛ-ДР
         pattern = (
             r"^(?:"
             r"литература|список литературы|использованная литература|"
@@ -849,5 +1538,3 @@ class PDFExtractor:
             return True
 
         return False
-
-

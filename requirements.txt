@@ -3,7 +3,6 @@
 # ==========================================
 PyMuPDF>=1.26.0
 mineru[all]==3.4.0
-unstructured[pdf]==0.23.1
 
 # ==========================================
 # LLM / Ollama
@@ -19,7 +18,11 @@ transformers>=4.50.0
 torch>=2.7.0
 accelerate>=1.0.0
 safetensors>=0.5.0
-
+chonkie[all]==1.6.8
+model2vec[all]==0.8.2
+sentence-transformers==5.2.0
+huggingface-hub==0.33.4
+bm25s>=0.2.0
 # ==========================================
 # Vector Database
 # ==========================================
@@ -39,8 +42,9 @@ langchain-huggingface>=0.1.0
 # ==========================================
 # LlamaIndex
 # ==========================================
-llama-index-core>=0.14.23
-
+chonkie==1.6.8
+llama-index-core==0.14.23
+llama-index-embeddings-huggingface==0.7.0
 # ==========================================
 # Data Processing
 # ==========================================
@@ -54,10 +58,12 @@ scikit-learn>=1.6.0
 tqdm>=4.67.0
 python-dotenv>=1.1.0
 pydantic>=2.11.0
-
+pymorphy3==2.0.6
+nltk==3.10.0
 # ==========================================
 # Evaluation
 # ==========================================
+rapidfuzz>=3.0.0
 ragas>=0.2.0
 
 # ==========================================

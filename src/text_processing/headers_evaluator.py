@@ -1,13 +1,13 @@
-from pathlib import Path
-import json
+from __future__ import annotations
 
-import pandas as pd
-import matplotlib.pyplot as plt
+import json
+import re
+from pathlib import Path
 
 from src.paths import PROJECT_ROOT
-from src.text_processing.pdf_extractor import PDFExtractor
+from src.text_processing.pdf_extracting.headers.headers_extractor import HeadersExtractor
 from src.text_processing.pdf_extracting.headers.headers_processor import HeadersProcessor
-from src.text_processing.compare_result import HeadersComparator
+from src.text_processing.pdf_extracting.mineru import MineruReader
 
 
 class HeadersEvaluator:
@@ -47,44 +47,239 @@ class HeadersEvaluator:
 
         self.threshold = threshold
 
-        self.extractor = PDFExtractor()
-        self.header_processor = HeadersProcessor()
-        self.comparator = HeadersComparator(
-            gold_path=self.gold_path,
-            threshold=self.threshold,
+        self.headers_extractor = HeadersExtractor(
+            mineru_reader=MineruReader(),
+            golden_headers_path=self.gold_path,
         )
+        self.header_processor = HeadersProcessor()
+        self.gold_data = self._load_gold_headers()
 
-    @staticmethod
-    def header_pretends_to_texts(headers) -> list[str]:
+    def _load_gold_headers(self) -> dict[str, list[str]]:
         """
-        Преобразует список HeaderPretend в список строк.
+        Загружает эталонные заголовки из JSON-файла.
 
-        :param headers: список объектов HeaderPretend
-        :return: список текстов заголовков
+        :return: словарь, где ключ — имя документа, значение — список заголовков
         """
-        return [
-            header.content
-            for header in headers
-            if header.content
-        ]
-
-    @staticmethod
-    def load_gold_documents(gold_path: str | Path) -> set[str]:
-        """
-        Загружает имена документов, для которых есть ручная разметка.
-
-        :param gold_path: путь к JSON-файлу с ручной разметкой
-        :return: множество имён PDF-файлов
-        """
-        gold_path = Path(gold_path)
-
-        with open(gold_path, "r", encoding="utf-8") as file:
+        with open(self.gold_path, "r", encoding="utf-8") as file:
             data = json.load(file)
 
         return {
-            item["document"]
+            item["document"]: item["headers"]
             for item in data
         }
+
+    def _normalize_header(self, text: str) -> str:
+        """
+        Нормализует заголовок перед fuzzy-сравнением.
+
+        :param text: исходный заголовок
+        :return: нормализованный заголовок
+        """
+        text = str(text).lower()
+        text = text.replace("ё", "е")
+        text = re.sub(r"[\uf000-\uf8ff]", " ", text)
+
+        for char in ("\u00ad", "\x0e", "\x19", "\x1a"):
+            text = text.replace(char, "")
+
+        text = text.replace("–", "-").replace("—", "-")
+        text = text.strip()
+        text = re.sub(r"(\d+)\s+\.", r"\1.", text)
+        text = re.sub(r"^(\d+)\.([а-яa-z])", r"\1. \2", text)
+        text = re.sub(r"^(\d+(?:\.\d+)+)([а-яa-z])", r"\1 \2", text)
+        text = re.sub(r"[:.;,\s]+$", "", text)
+        text = re.sub(r"[^\w\s.\-]", " ", text)
+        text = re.sub(r"\s+", " ", text)
+        return text.strip()
+
+    def _make_compare_items(self, headers: list[str]) -> list[dict]:
+        """
+        Готовит заголовки к сравнению.
+
+        :param headers: список исходных заголовков
+        :return: список элементов с исходной и нормализованной формой
+        """
+        items = []
+
+        for header in headers:
+            normalized = self._normalize_header(header)
+
+            if normalized:
+                items.append({
+                    "original": header,
+                    "normalized": normalized,
+                })
+
+        return items
+
+    def _compare_headers(
+            self,
+            document: str | Path,
+            predicted_headers: list[str],
+            method: str,
+    ) -> dict:
+        """
+        Сравнивает найденные заголовки с эталонной разметкой.
+
+        :param document: имя документа или путь к PDF-файлу
+        :param predicted_headers: найденные заголовки
+        :param method: название метода извлечения
+        :return: словарь с метриками и списками ошибок
+        """
+        from rapidfuzz import fuzz
+
+        document_name = Path(document).name
+
+        if document_name not in self.gold_data:
+            raise ValueError(f"Для документа {document_name} нет ручной разметки")
+
+        gold_items = self._make_compare_items(self.gold_data[document_name])
+        predicted_items = self._make_compare_items(predicted_headers)
+
+        matched_gold = set()
+        matched_predicted = set()
+        matches = []
+
+        for pred_idx, pred_item in enumerate(predicted_items):
+            best_score = 0
+            best_gold_idx = None
+
+            for gold_idx, gold_item in enumerate(gold_items):
+                if gold_idx in matched_gold:
+                    continue
+
+                score = fuzz.token_sort_ratio(
+                    pred_item["normalized"],
+                    gold_item["normalized"],
+                )
+
+                if score > best_score:
+                    best_score = score
+                    best_gold_idx = gold_idx
+
+            if best_gold_idx is not None and best_score >= self.threshold:
+                matched_predicted.add(pred_idx)
+                matched_gold.add(best_gold_idx)
+                matches.append({
+                    "gold": gold_items[best_gold_idx]["original"],
+                    "predicted": pred_item["original"],
+                    "gold_norm": gold_items[best_gold_idx]["normalized"],
+                    "predicted_norm": pred_item["normalized"],
+                    "score": round(best_score, 2),
+                })
+
+        true_positive = len(matched_predicted)
+        false_positive = len(predicted_items) - true_positive
+        false_negative = len(gold_items) - true_positive
+
+        precision = true_positive / max(true_positive + false_positive, 1)
+        recall = true_positive / max(true_positive + false_negative, 1)
+        f1 = 2 * precision * recall / max(precision + recall, 1e-9)
+
+        return {
+            "document": document_name,
+            "method": method,
+            "TP": true_positive,
+            "FP": false_positive,
+            "FN": false_negative,
+            "precision": round(precision, 4),
+            "recall": round(recall, 4),
+            "f1": round(f1, 4),
+            "missing": [
+                item["original"]
+                for idx, item in enumerate(gold_items)
+                if idx not in matched_gold
+            ],
+            "extra": [
+                item["original"]
+                for idx, item in enumerate(predicted_items)
+                if idx not in matched_predicted
+            ],
+            "matches": matches,
+        }
+
+    def _compare_many_methods(
+            self,
+            document: str | Path,
+            methods_headers: dict[str, list[str]],
+    ) -> list[dict]:
+        """
+        Сравнивает несколько методов извлечения заголовков.
+
+        :param document: имя документа или путь к PDF-файлу
+        :param methods_headers: словарь method_name -> headers
+        :return: список результатов сравнения
+        """
+        return [
+            self._compare_headers(
+                document=document,
+                predicted_headers=headers,
+                method=method,
+            )
+            for method, headers in methods_headers.items()
+        ]
+
+    def _summarize_results(self, results: list[dict]) -> dict[str, dict]:
+        """
+        Агрегирует результаты сравнения по методам.
+
+        :param results: список результатов сравнения
+        :return: итоговая статистика по каждому методу
+        """
+        grouped = {}
+
+        for result in results:
+            method = result["method"]
+
+            if method not in grouped:
+                grouped[method] = {
+                    "true_positive": 0,
+                    "false_positive": 0,
+                    "false_negative": 0,
+                    "documents": 0,
+                    "precision_values": [],
+                    "recall_values": [],
+                    "f1_values": [],
+                }
+
+            grouped[method]["true_positive"] += result["TP"]
+            grouped[method]["false_positive"] += result["FP"]
+            grouped[method]["false_negative"] += result["FN"]
+            grouped[method]["documents"] += 1
+            grouped[method]["precision_values"].append(result["precision"])
+            grouped[method]["recall_values"].append(result["recall"])
+            grouped[method]["f1_values"].append(result["f1"])
+
+        summary = {}
+
+        for method, values in grouped.items():
+            true_positive = values["true_positive"]
+            false_positive = values["false_positive"]
+            false_negative = values["false_negative"]
+
+            precision = true_positive / max(true_positive + false_positive, 1)
+            recall = true_positive / max(true_positive + false_negative, 1)
+            f1 = 2 * precision * recall / max(precision + recall, 1e-9)
+
+            documents_count = max(values["documents"], 1)
+            macro_precision = sum(values["precision_values"]) / documents_count
+            macro_recall = sum(values["recall_values"]) / documents_count
+            macro_f1 = sum(values["f1_values"]) / documents_count
+
+            summary[method] = {
+                "documents": values["documents"],
+                "true_positive": true_positive,
+                "false_positive": false_positive,
+                "false_negative": false_negative,
+                "precision": round(precision, 4),
+                "recall": round(recall, 4),
+                "f1": round(f1, 4),
+                "macro_precision": round(macro_precision, 4),
+                "macro_recall": round(macro_recall, 4),
+                "macro_f1": round(macro_f1, 4),
+            }
+
+        return summary
 
     def collect_headers_for_document(
             self,
@@ -101,11 +296,8 @@ class HeadersEvaluator:
         """
         pdf_path = Path(pdf_path)
 
-        mineru_pretends = self.extractor.get_headers_by_mineru(str(pdf_path))
-        mupdf_pretends = self.extractor.get_headers_by_mupdf(str(pdf_path))
-
-        mineru_raw = self.header_pretends_to_texts(mineru_pretends)
-        mupdf_raw = self.header_pretends_to_texts(mupdf_pretends)
+        mineru_raw = self.headers_extractor.get_headers_by_mineru(str(pdf_path))
+        mupdf_raw = self.headers_extractor.get_headers_by_mupdf(str(pdf_path))
 
         mineru_clean = self.header_processor.clear_headers(mineru_raw)
         mupdf_clean = self.header_processor.clear_headers(mupdf_raw)
@@ -122,41 +314,43 @@ class HeadersEvaluator:
             "mixed_clean": mixed_clean,
         }
 
-    @staticmethod
-    def results_to_dataframe(results) -> pd.DataFrame:
+    def results_to_dataframe(self, results) -> pd.DataFrame:
         """
         Преобразует список HeadersCompareResult в pandas DataFrame.
 
         :param results: список результатов сравнения
         :return: таблица с результатами по документам и методам
         """
+        import pandas as pd
+
         rows = []
 
         for result in results:
             rows.append({
-                "document": result.document,
-                "method": result.method,
-                "TP": result.true_positive,
-                "FP": result.false_positive,
-                "FN": result.false_negative,
-                "precision": result.precision,
-                "recall": result.recall,
-                "f1": result.f1,
-                "missing": result.missing,
-                "extra": result.extra,
-                "matches": result.matches,
+                "document": result["document"],
+                "method": result["method"],
+                "TP": result["TP"],
+                "FP": result["FP"],
+                "FN": result["FN"],
+                "precision": result["precision"],
+                "recall": result["recall"],
+                "f1": result["f1"],
+                "missing": result["missing"],
+                "extra": result["extra"],
+                "matches": result["matches"],
             })
 
         return pd.DataFrame(rows)
 
-    @staticmethod
-    def summary_to_dataframe(summary: dict[str, dict]) -> pd.DataFrame:
+    def summary_to_dataframe(self, summary: dict[str, dict]) -> pd.DataFrame:
         """
         Преобразует итоговую статистику в pandas DataFrame.
 
         :param summary: словарь с агрегированными метриками
         :return: таблица с итоговыми метриками по методам
         """
+        import pandas as pd
+
         rows = []
 
         for method, values in summary.items():
@@ -190,7 +384,7 @@ class HeadersEvaluator:
 
         :return: results_df, summary_df
         """
-        gold_documents = self.load_gold_documents(self.gold_path)
+        gold_documents = set(self.gold_data)
         pdf_paths = sorted(self.pdfs_dir.glob("*.pdf"))
 
         all_results = []
@@ -206,7 +400,7 @@ class HeadersEvaluator:
                 pdf_path=pdf_path,
             )
 
-            document_results = self.comparator.compare_many_methods(
+            document_results = self._compare_many_methods(
                 document=pdf_path.name,
                 methods_headers=methods_headers,
             )
@@ -218,7 +412,7 @@ class HeadersEvaluator:
                 "Нет результатов для сравнения. Проверь data/pdfs и gold_headers.json"
             )
 
-        summary = HeadersComparator.summarize_results(all_results)
+        summary = self._summarize_results(all_results)
 
         results_df = self.results_to_dataframe(all_results)
         summary_df = self.summary_to_dataframe(summary)
@@ -241,21 +435,22 @@ class HeadersEvaluator:
             pdf_path=pdf_path,
         )
 
-        results = self.comparator.compare_many_methods(
+        results = self._compare_many_methods(
             document=pdf_path.name,
             methods_headers=methods_headers,
         )
 
         return self.results_to_dataframe(results)
 
-    @staticmethod
-    def plot_summary_metrics(summary_df: pd.DataFrame) -> None:
+    def plot_summary_metrics(self, summary_df: pd.DataFrame) -> None:
         """
         Строит график Precision, Recall и F1 по методам.
 
         :param summary_df: итоговая таблица метрик
         :return: None
         """
+        import matplotlib.pyplot as plt
+
         plot_df = summary_df.copy()
         plot_df = plot_df.sort_values("f1", ascending=False)
 
@@ -274,14 +469,15 @@ class HeadersEvaluator:
         plt.tight_layout()
         plt.show()
 
-    @staticmethod
-    def plot_macro_metrics(summary_df: pd.DataFrame) -> None:
+    def plot_macro_metrics(self, summary_df: pd.DataFrame) -> None:
         """
         Строит график Macro Precision, Macro Recall и Macro F1 по методам.
 
         :param summary_df: итоговая таблица метрик
         :return: None
         """
+        import matplotlib.pyplot as plt
+
         plot_df = summary_df.copy()
         plot_df = plot_df.sort_values("macro_f1", ascending=False)
 
@@ -300,14 +496,15 @@ class HeadersEvaluator:
         plt.tight_layout()
         plt.show()
 
-    @staticmethod
-    def plot_f1_by_method(summary_df: pd.DataFrame) -> None:
+    def plot_f1_by_method(self, summary_df: pd.DataFrame) -> None:
         """
         Строит отдельный график F1 по методам.
 
         :param summary_df: итоговая таблица метрик
         :return: None
         """
+        import matplotlib.pyplot as plt
+
         plot_df = summary_df.copy()
         plot_df = plot_df.sort_values("f1", ascending=True)
 
@@ -323,14 +520,15 @@ class HeadersEvaluator:
         plt.tight_layout()
         plt.show()
 
-    @staticmethod
-    def plot_errors(summary_df: pd.DataFrame) -> None:
+    def plot_errors(self, summary_df: pd.DataFrame) -> None:
         """
         Строит график TP, FP и FN по методам.
 
         :param summary_df: итоговая таблица метрик
         :return: None
         """
+        import matplotlib.pyplot as plt
+
         plot_df = summary_df.copy()
         plot_df = plot_df.sort_values("f1", ascending=False)
 
@@ -348,14 +546,15 @@ class HeadersEvaluator:
         plt.tight_layout()
         plt.show()
 
-    @staticmethod
-    def plot_document_f1(results_df: pd.DataFrame) -> None:
+    def plot_document_f1(self, results_df: pd.DataFrame) -> None:
         """
         Строит график F1 по каждому документу и методу.
 
         :param results_df: подробная таблица результатов
         :return: None
         """
+        import matplotlib.pyplot as plt
+
         pivot_df = results_df.pivot(
             index="document",
             columns="method",
@@ -375,14 +574,15 @@ class HeadersEvaluator:
         plt.tight_layout()
         plt.show()
 
-    @staticmethod
-    def plot_missing_extra(results_df: pd.DataFrame) -> None:
+    def plot_missing_extra(self, results_df: pd.DataFrame) -> None:
         """
         Строит график количества пропущенных и лишних заголовков по документам.
 
         :param results_df: подробная таблица результатов
         :return: None
         """
+        import matplotlib.pyplot as plt
+
         plot_df = results_df.copy()
 
         plot_df["missing_count"] = plot_df["missing"].apply(len)
@@ -404,8 +604,8 @@ class HeadersEvaluator:
         plt.tight_layout()
         plt.show()
 
-    @staticmethod
     def plot_all(
+            self,
             results_df: pd.DataFrame,
             summary_df: pd.DataFrame,
     ) -> None:
@@ -416,9 +616,9 @@ class HeadersEvaluator:
         :param summary_df: итоговая таблица метрик
         :return: None
         """
-        HeadersEvaluator.plot_summary_metrics(summary_df)
-        HeadersEvaluator.plot_macro_metrics(summary_df)
-        HeadersEvaluator.plot_f1_by_method(summary_df)
-        HeadersEvaluator.plot_errors(summary_df)
-        HeadersEvaluator.plot_document_f1(results_df)
-        HeadersEvaluator.plot_missing_extra(results_df)
+        self.plot_summary_metrics(summary_df)
+        self.plot_macro_metrics(summary_df)
+        self.plot_f1_by_method(summary_df)
+        self.plot_errors(summary_df)
+        self.plot_document_f1(results_df)
+        self.plot_missing_extra(results_df)

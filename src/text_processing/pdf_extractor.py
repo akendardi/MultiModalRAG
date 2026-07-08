@@ -1,7 +1,6 @@
 from copy import deepcopy
 from pathlib import Path
 from enum import auto, Enum
-import fitz
 import re
 from dataclasses import dataclass
 from src.text_processing.mineru import run_mineru
@@ -1105,6 +1104,8 @@ class PDFExtractor:
         :param file_path: путь к PDF-файлу
         :return: список нормализованных заголовков разделов
         """
+        import fitz
+
         bold_titles = []
         all_lines = []
         with fitz.open(file_path) as file:

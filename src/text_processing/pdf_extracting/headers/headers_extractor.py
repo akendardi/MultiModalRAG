@@ -2,7 +2,6 @@ import json
 import re
 from pathlib import Path
 
-import fitz
 from src.paths import PROJECT_ROOT
 from src.text_processing.pdf_extracting.mineru import MineruReader
 
@@ -54,6 +53,8 @@ class HeadersExtractor:
         :param file_path: путь к PDF-документу
         :return: список строк-заголовков
         """
+        import fitz
+
         bold_titles = []
 
         with fitz.open(file_path) as file:

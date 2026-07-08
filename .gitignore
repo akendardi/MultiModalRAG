@@ -51,6 +51,8 @@ data/embeddings/
 data/vector_store/
 data/faiss/
 data/chroma/
+data/experiments/
+data/experiments_*/
 
 # Model / checkpoints
 checkpoints/
@@ -76,6 +78,7 @@ cache/
 **/*_content_list*.json
 **/*_middle*.json
 **/*.md
+!README.md
 
 # PDF / documents generated during experiments
 *.pdf

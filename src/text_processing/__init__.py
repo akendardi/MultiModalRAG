@@ -13,6 +13,7 @@ __all__ = [
     "ContextBuilder",
     "DocumentType",
     "HeaderPretend",
+    "HeadersEvaluator",
     "HeadersExtractor",
     "HeadersProcessor",
     "Metadata",
@@ -24,6 +25,11 @@ __all__ = [
 
 
 def __getattr__(name):
+    if name == "HeadersEvaluator":
+        from .headers_evaluator import HeadersEvaluator
+
+        return HeadersEvaluator
+
     if name == "HeadersExtractor":
         from .pdf_extracting import HeadersExtractor
 

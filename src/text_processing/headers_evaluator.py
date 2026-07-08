@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 
 from src.paths import PROJECT_ROOT
 from src.text_processing.pdf_extractor import PDFExtractor
-from src.text_processing.headers_preprocessor import HeadersProcessor
+from src.text_processing.pdf_extracting.headers.headers_processor import HeadersProcessor
 from src.text_processing.compare_result import HeadersComparator
 
 
@@ -48,6 +48,7 @@ class HeadersEvaluator:
         self.threshold = threshold
 
         self.extractor = PDFExtractor()
+        self.header_processor = HeadersProcessor()
         self.comparator = HeadersComparator(
             gold_path=self.gold_path,
             threshold=self.threshold,
@@ -106,10 +107,10 @@ class HeadersEvaluator:
         mineru_raw = self.header_pretends_to_texts(mineru_pretends)
         mupdf_raw = self.header_pretends_to_texts(mupdf_pretends)
 
-        mineru_clean = HeadersProcessor.clear_headers(mineru_raw)
-        mupdf_clean = HeadersProcessor.clear_headers(mupdf_raw)
+        mineru_clean = self.header_processor.clear_headers(mineru_raw)
+        mupdf_clean = self.header_processor.clear_headers(mupdf_raw)
 
-        mixed_clean = HeadersProcessor.deduplicate_headers(
+        mixed_clean = self.header_processor.clear_headers(
             mineru_clean + mupdf_clean
         )
 

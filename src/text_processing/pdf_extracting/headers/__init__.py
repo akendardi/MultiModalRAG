@@ -1,17 +1,11 @@
 from .headers_processor import HeadersProcessor
 from .section_context_builder import ContextBuilder
+from .headers_extractor import HeadersExtractor
+from .headers_evaluator import HeadersEvaluator
 
 __all__ = [
     "ContextBuilder",
     "HeadersExtractor",
     "HeadersProcessor",
+    "HeadersEvaluator",
 ]
-
-
-def __getattr__(name):
-    if name == "HeadersExtractor":
-        from .headers_extractor import HeadersExtractor
-
-        return HeadersExtractor
-
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

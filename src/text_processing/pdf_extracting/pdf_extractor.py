@@ -25,10 +25,10 @@ class PDFExtractor:
         self.headers_processor = HeadersProcessor()
         self.context_builder = ContextBuilder()
 
-    def get_documents_from_text(
+    def get_documents_from_pdf(
             self,
             pdf_path: str | Path,
-            use_context: bool = False,
+            use_context: bool = True,
             headers_source: str = "golden",
             clean_headers: bool = True,
             keep_abstract_before_first_section: bool = True,

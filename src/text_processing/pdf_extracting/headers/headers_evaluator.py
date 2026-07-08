@@ -524,7 +524,7 @@ class HeadersEvaluator:
         """
         Строит график TP, FP и FN по методам.
 
-        :param summary_df: итоговая таблица метрик
+        :param summary_df: Итоговая таблица метрик
         :return: None
         """
         import matplotlib.pyplot as plt

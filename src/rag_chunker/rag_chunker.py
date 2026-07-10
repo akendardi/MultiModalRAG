@@ -74,7 +74,7 @@ class RagChunker:
         chunks = chunker.chunk(text)
         last_idx = 0
         rag_chunks = []
-
+        chunk_idx = 0
         for chunk in chunks:
             relevant_docs, idx = self._get_documents_from_chunk(chunk, documents, last_idx)
             if not relevant_docs:
@@ -85,11 +85,9 @@ class RagChunker:
             content_types = list(dict.fromkeys(i.content_type for i in relevant_docs))
             asset_paths = self._get_asset_paths(relevant_docs)
             section = self._get_main_section(relevant_docs, chunk.start_index, chunk.end_index)
-            start_page = min(pages)
-            end_page = max(pages)
             rag_chunk = RagChunk(
                 source=source,
-                chunk_id=f"{source}:{start_page}-{end_page}:{chunk.id}",
+                chunk_id=f"{source}:{chunk_idx}",
                 content=chunk.text,
                 section=section,
                 pages=pages,
@@ -97,6 +95,7 @@ class RagChunker:
                 asset_paths=asset_paths
             )
             rag_chunks.append(rag_chunk)
+            chunk_idx += 1
         return rag_chunks
 
     def visualize_chunks(self, chunks: list[RagChunk]) -> None:

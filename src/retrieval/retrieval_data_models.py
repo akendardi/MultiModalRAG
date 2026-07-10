@@ -1,7 +1,9 @@
 from dataclasses import dataclass
-from src.rag_chunker import RagChunk
+from llama_index.core.schema import TextNode
+
+
 @dataclass
 class RetrievalResults:
-    results: list[RagChunk]
+    results: list[TextNode]
     scores: list[float]
-    context_chunks: list[RagChunk]
+    context_chunks: list[TextNode]

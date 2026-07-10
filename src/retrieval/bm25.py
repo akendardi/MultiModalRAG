@@ -1,144 +1,102 @@
+import re
+
 from bm25s import BM25, tokenize
 from bm25s.stopwords import STOPWORDS_RUSSIAN
+from llama_index.core.schema import TextNode
+from pymorphy3 import MorphAnalyzer
+
 from src.rag_chunker import RagChunk
+from .base_retriever import BaseRetriever
 from .retrieval_data_models import RetrievalResults
 
 
-class BM25Retriever:
-    #expansion_strategy: none, neighbors, first_section, all_section
-    def __init__(self, expansion_strategy: str = "none", use_section: bool = True, top_k: int = 5):
+class BM25Retriever(BaseRetriever):
 
-        allowed_strategy = {
-            "none", "neighbors", "first_section", "all_sections"
-        }
-        if expansion_strategy not in allowed_strategy:
-            raise ValueError(f"Expansion strategy {expansion_strategy} is not supported.")
+    def __init__(
+            self,
+            insert_metadata_into_text: bool = True,
+            expansion_strategy: str = "none",
+            top_k: int = 5,
+            use_lemmatization: bool = True,
+    ):
+        super().__init__(insert_metadata_into_text, expansion_strategy, top_k)
 
+        self.text_normalizer = _BM25TextNormalizer(
+            use_lemmatization=use_lemmatization
+        )
         self.bm25 = BM25()
-        self.chunks = None
-        self.top_k = top_k
-        self.use_section = use_section
-        self.expansion_strategy = expansion_strategy
 
-    def _build_text(self, chunk: RagChunk) -> str:
-        if self.use_section:
-            return " ".join([
-                chunk.section or '',
-                chunk.content or '',
-            ])
-        return chunk.content or ""
 
-    def index(self, chunks: list[RagChunk]) -> None:
+    def _build_text(self, node: TextNode) -> str:
+        content = node.text
+        content = self.text_normalizer.preprocess_text(content)
+        return content
 
-        corpus = [self._build_text(chunk) for chunk in chunks]
+    def index(self, items: list[RagChunk] | list[TextNode]) -> None:
+
+        self.nodes = self._to_nodes(items)
+        corpus = [self._build_text(node) for node in self.nodes]
         corpus_tokens = tokenize(corpus, stopwords=STOPWORDS_RUSSIAN, show_progress=False)
 
-        self.chunks = chunks
         self.bm25.index(corpus_tokens, show_progress=False)
 
     def retrieve(self, query: str) -> RetrievalResults:
 
-        if self.chunks is None:
+        if self.nodes is None:
             raise AttributeError("Please call index() before retrieving")
+
+        query = self.text_normalizer.preprocess_text(query)
 
         query_tokens = tokenize(query, stopwords=STOPWORDS_RUSSIAN, show_progress=False)
-        results, scores = self.bm25.retrieve(query_tokens, corpus=self.chunks, k=self.top_k)
-
-        retrieved_chunks = list(results[0])
-        retrieved_scores = [float(score) for score in scores[0]]
-        context_chunks = self._get_context_chunks(retrieved_chunks)
-
-        return RetrievalResults(
-            results=retrieved_chunks,
-            scores=retrieved_scores,
-            context_chunks=context_chunks,
+        results, scores = self.bm25.retrieve(
+            query_tokens,
+            corpus=self.nodes,
+            k=min(self.top_k, len(self.nodes)),
+            show_progress=False,
         )
 
-    def _get_context_chunks(self, result_chunks: list[RagChunk]) -> list[RagChunk]:
-        if self.expansion_strategy == "none":
-            return result_chunks
-        elif self.expansion_strategy == "first_section" or self.expansion_strategy == "all_section":
-            relevant_chunks = self._get_section_chunks(result_chunks)
-        elif self.expansion_strategy == "neighbors":
-            relevant_chunks = self._get_neighbours_chunks(result_chunks)
-        else:
-            raise ValueError("Unknown expansion strategy: ", self.expansion_strategy)
-        return relevant_chunks
+        retrieved_nodes = list(results[0])
+        retrieved_scores = [float(score) for score in scores[0]]
+        context_nodes = self._get_context_nodes(retrieved_nodes)
 
-    def _get_neighbours_chunks(
+        return RetrievalResults(
+            results=retrieved_nodes,
+            scores=retrieved_scores,
+            context_chunks=context_nodes,
+        )
+
+
+class _BM25TextNormalizer:
+    def __init__(
             self,
-            result_chunks: list[RagChunk],
-    ) -> list[RagChunk]:
-        if self.chunks is None:
-            raise AttributeError("Please call index() before retrieving")
+            use_lemmatization: bool = True,
+    ):
+        self.use_lemmatization = use_lemmatization
+        self.morph = MorphAnalyzer() if use_lemmatization else None
 
-        chunk_id_to_idx = {
-            chunk.chunk_id: idx
-            for idx, chunk in enumerate(self.chunks)
-        }
-        selected_indices = set()
-        for chunk in result_chunks:
-
-            idx = chunk_id_to_idx.get(chunk.chunk_id)
-            if idx is None:
-                continue
-
-            for neighbour_idx in [idx - 1, idx, idx + 1]:
-                if 0 <= neighbour_idx < len(self.chunks):
-                    neighbour = self.chunks[neighbour_idx]
-
-                    same_source = neighbour.source == chunk.source
-
-                    if same_source:
-                        selected_indices.add(neighbour_idx)
-        return [
-            self.chunks[idx]
-            for idx in sorted(selected_indices)
-
+    def _lemmatize_text(self, text: str) -> str:
+        if not self.use_lemmatization or self.morph is None:
+            return text
+        words = text.split()
+        lemmas = [
+            self.morph.parse(word)[0].normal_form
+            for word in words
         ]
 
-    def _get_section_chunks(
-        self,
-        result_chunks: list[RagChunk],
-    ) -> list[RagChunk]:
-        if self.chunks is None:
-            raise AttributeError("Please call index() before retrieving")
+        return " ".join(lemmas)
 
-        if not result_chunks:
-            return []
+    def _normalize_text(self, text: str | None) -> str:
+        if text is None:
+            return ""
+        text = str(text).lower()
 
-        if self.expansion_strategy == "first_section":
-            first_chunk = result_chunks[0]
+        text = text.replace("ё", "е")
+        text = re.sub(r"[^а-яa-z0-9\s\-]", " ", text)
+        text = re.sub(r"\s+", " ", text).strip()
 
-            if first_chunk.section is None or first_chunk.section == "":
-                return self._get_neighbours_chunks(result_chunks)
+        return text
 
-            relevant_section_keys = {
-                (first_chunk.source, first_chunk.section)
-            }
-
-        elif self.expansion_strategy == "all_section":
-            chunks_with_sections = [
-                chunk
-                for chunk in result_chunks
-                if chunk.section is not None and chunk.section != ""
-            ]
-
-            if not chunks_with_sections:
-                return self._get_neighbours_chunks(result_chunks)
-
-            relevant_section_keys = {
-                (chunk.source, chunk.section)
-                for chunk in chunks_with_sections
-            }
-
-        else:
-            return result_chunks
-
-        relevant_chunks = [
-            chunk
-            for chunk in self.chunks
-            if (chunk.source, chunk.section) in relevant_section_keys
-        ]
-
-        return relevant_chunks
+    def preprocess_text(self, text: str | None) -> str:
+        text = self._normalize_text(text)
+        text = self._lemmatize_text(text)
+        return text
